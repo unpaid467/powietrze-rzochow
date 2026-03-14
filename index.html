@@ -188,7 +188,7 @@
     <div class="header-icon">🌬️</div>
     <h1>Monitoring Jakości Powietrza</h1>
     <p class="header-sub">📍 Rzochowska, Mielec, Polska</p>
-    <p class="header-meta">ID czujnika: 210868 &nbsp;|&nbsp; Źródło: Sensor.Community / Madavi.de</p>
+    <p class="header-meta">Czujniki: SDS011 #63261 + BME280 #63262 &nbsp;|&nbsp; Źródło: data.sensor.community</p>
     <p id="lastUpdate">Pobieranie…</p>
 </header>
 
@@ -330,15 +330,14 @@
 'use strict';
 
 /* ───── CONFIG ───── */
-const SENSOR_ID        = 210868;
-// NOTE: api.sensor.community is write-only; reads must use data.sensor.community
-const API_URL          = `https://data.sensor.community/airrohr/v1/sensor/${SENSOR_ID}/`;
-const ARCHIVE_BASE     = 'https://archive.sensor.community';
-const MADAVI_BASE      = 'https://api-rrd.madavi.de/data';
-const STORAGE_KEY      = `aq_${SENSOR_ID}`;
-const REFRESH_MS       = 5 * 60 * 1000;   // 5 minutes
-// User-Agent required by sensor.community API since 2022-11-04
-const UA_HEADER        = { 'User-Agent': 'AirQualityMonitor/1.0 (Mielec; educational)' };
+// Actual active sensor IDs at Rzochowska / Mielec (confirmed via area search 50.249,21.484)
+// Note: sensor ID 210868 returns no data – these are the real active IDs at this location
+const PM_SENSOR_ID  = 63261;   // SDS011  – P1=PM10, P2=PM2.5
+const ENV_SENSOR_ID = 63262;   // BME280  – temperature, humidity, pressure
+const API_BASE      = 'https://data.sensor.community/airrohr/v1/sensor';
+const ARCHIVE_BASE  = 'https://archive.sensor.community';
+const STORAGE_KEY   = 'aq_mielec_rzochowska_v2';
+const REFRESH_MS    = 5 * 60 * 1000;   // 5 minutes
 
 /* ───── POLISH AIR QUALITY LEVELS (GIOŚ) ───── */
 const PM25_LEVELS = [
@@ -400,119 +399,119 @@ function saveLocal(readings) {
     try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify({
             date: todayStr(),
-            readings: readings.slice(-576)   // max 48h worth at 5-min intervals
+            readings: readings.slice(-576)
         }));
     } catch { /* storage full – ignore */ }
 }
 
-/* ───── API FETCH ───── */
-async function fetchLive() {
-    // User-Agent is a forbidden header in browsers; the browser sends it automatically.
-    // We pass it as a hint but browsers will silently ignore the override (that's fine).
-    const r = await fetch(API_URL, {
-        cache: 'no-store',
-        headers: { 'Accept': 'application/json' },
-    });
-    if (!r.ok) throw new Error(`API odpowiedział: ${r.status}`);
-    return r.json();
+/* ───── API FETCH (dual-sensor) ───── */
+async function fetchSensor(sensorId) {
+    const url = `${API_BASE}/${sensorId}/`;
+    const r = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json' } });
+    if (!r.ok) throw new Error(`HTTP ${r.status} dla czujnika ${sensorId}`);
+    const data = await r.json();
+    if (!Array.isArray(data) || data.length === 0) throw new Error(`Brak danych z czujnika ${sensorId}`);
+    return data;
 }
 
-/* ───── MADAVI CSV FETCH (today's intraday data) ───── */
-// Madavi writes a CSV per sensor per day that grows throughout the day.
-// URL pattern: https://api-rrd.madavi.de/data/YYYY-MM-DD/YYYY-MM-DD_<type>_sensor_<id>.csv
-async function fetchMadaviToday(sensorTypeName, dateStr) {
-    const type = (sensorTypeName || 'sds011').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const url = `${MADAVI_BASE}/${dateStr}/${dateStr}_${type}_sensor_${SENSOR_ID}.csv`;
+async function fetchLiveBoth() {
+    // Fetch PM sensor and ENV sensor in parallel
+    const [pmData, envData] = await Promise.allSettled([
+        fetchSensor(PM_SENSOR_ID),
+        fetchSensor(ENV_SENSOR_ID),
+    ]);
+
+    let pm25 = null, pm10 = null, temp = null, hum = null, pressure = null, timestamp = null;
+
+    // Parse PM sensor (SDS011): P1=PM10, P2=PM2.5
+    if (pmData.status === 'fulfilled') {
+        const entry = pmData.value[0];
+        timestamp = entry.timestamp;
+        (entry.sensordatavalues || []).forEach(sv => {
+            if (sv.value_type === 'P2') pm25 = parseFloatOrNull(sv.value);
+            if (sv.value_type === 'P1') pm10 = parseFloatOrNull(sv.value);
+        });
+    } else {
+        console.warn('PM sensor fetch failed:', pmData.reason);
+    }
+
+    // Parse ENV sensor (BME280): temperature, humidity, pressure
+    if (envData.status === 'fulfilled') {
+        const entry = envData.value[0];
+        if (!timestamp) timestamp = entry.timestamp;
+        (entry.sensordatavalues || []).forEach(sv => {
+            if (sv.value_type === 'temperature') temp     = parseFloatOrNull(sv.value);
+            if (sv.value_type === 'humidity')    hum      = parseFloatOrNull(sv.value);
+            if (sv.value_type === 'pressure')    pressure = parseFloatOrNull(sv.value);
+        });
+    } else {
+        console.warn('ENV sensor fetch failed:', envData.reason);
+    }
+
+    if (pm25 === null && pm10 === null && temp === null) {
+        throw new Error('Oba czujniki nie zwróciły danych');
+    }
+
+    return { timestamp: timestamp || new Date().toISOString(), pm25, pm10, temp, hum, pressure };
+}
+
+/* ───── ARCHIVE CSV (sensor.community – published ~08:00 for previous day) ───── */
+async function fetchArchiveCSV(dateStr) {
+    // Fetches PM (SDS011) archive for given date; returns [] on any error
+    const url = `${ARCHIVE_BASE}/${dateStr}/${dateStr}_sds011_sensor_${PM_SENSOR_ID}.csv`;
     const r = await fetch(url, { cache: 'no-store' });
-    if (!r.ok) throw new Error(`brak pliku Madavi (${r.status})`);
-    const text = await r.text();
-    return parseMadaviCSV(text);
-}
-
-/* ───── ARCHIVE CSV FETCH (previous days) ───── */
-// archive.sensor.community is generated once daily ~08:00 for the PREVIOUS day.
-async function fetchArchive(sensorTypeName, dateStr) {
-    const type = (sensorTypeName || 'sds011').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const url = `${ARCHIVE_BASE}/${dateStr}/${dateStr}_${type}_sensor_${SENSOR_ID}.csv`;
-    const r = await fetch(url, { cache: 'no-store' });
-    if (!r.ok) throw new Error('brak archiwum');
-    return parseCSV(await r.text());
-}
-
-/* Parse sensor.community archive CSV (semicolon-separated) */
-function parseCSV(text) {
-    const lines = text.trim().split('\n');
+    if (!r.ok) return [];
+    const lines = (await r.text()).trim().split('\n');
     if (lines.length < 2) return [];
     const headers = lines[0].split(';').map(h => h.trim());
-    const result = [];
-    for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(';');
+    return lines.slice(1).map(line => {
+        const cols = line.split(';');
         const row = {};
-        headers.forEach((h, idx) => { row[h] = cols[idx]?.trim() ?? ''; });
-        const ts = row['timestamp'] || row['Timestamp'] || '';
-        if (!ts) continue;
-        result.push({
+        headers.forEach((h, i) => { row[h] = cols[i]?.trim() ?? ''; });
+        const ts = row['timestamp'] || '';
+        if (!ts) return null;
+        return {
             timestamp: ts,
-            pm25:  parseFloatOrNull(row['P2']),
-            pm10:  parseFloatOrNull(row['P1']),
-            temp:  parseFloatOrNull(row['temperature'] || row['temp']),
-            hum:   parseFloatOrNull(row['humidity']    || row['hum']),
-        });
-    }
-    return result.filter(r => r.pm25 !== null || r.pm10 !== null);
-}
-
-/* Parse Madavi CSV — uses comma separator and slightly different column names */
-function parseMadaviCSV(text) {
-    const lines = text.trim().split('\n');
-    if (lines.length < 2) return [];
-    // Detect separator (Madavi uses semicolons too in practice)
-    const sep = lines[0].includes(';') ? ';' : ',';
-    const headers = lines[0].split(sep).map(h => h.trim().replace(/^"|"$/g, ''));
-    const result = [];
-    for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(sep);
-        const row = {};
-        headers.forEach((h, idx) => { row[h] = (cols[idx] ?? '').trim().replace(/^"|"$/g, ''); });
-        // Madavi timestamp column names
-        const ts = row['Time'] || row['time'] || row['timestamp'] || row['Timestamp'] || '';
-        if (!ts) continue;
-        // Normalise timestamp to ISO-like format expected by rest of code
-        const normTs = ts.replace('T', ' ').replace(/Z$/, '');
-        result.push({
-            timestamp: normTs,
-            pm25:  parseFloatOrNull(row['SDS_P2'] || row['P2'] || row['pm2.5'] || row['pm25']),
-            pm10:  parseFloatOrNull(row['SDS_P1'] || row['P1'] || row['pm10']),
-            temp:  parseFloatOrNull(row['BME280_temperature'] || row['DHT22_temperature'] || row['temperature'] || row['temp']),
-            hum:   parseFloatOrNull(row['BME280_humidity']    || row['DHT22_humidity']    || row['humidity']    || row['hum']),
-        });
-    }
-    return result.filter(r => r.pm25 !== null || r.pm10 !== null);
+            pm25: parseFloatOrNull(row['P2']),
+            pm10: parseFloatOrNull(row['P1']),
+            temp: null, hum: null, pressure: null,
+        };
+    }).filter(r => r && (r.pm25 !== null || r.pm10 !== null));
 }
 
 function parseFloatOrNull(v) {
     if (v === '' || v === undefined || v === null) return null;
-    const n = parseFloat(v);
+    const n = parseFloat(String(v));
     return isNaN(n) ? null : n;
 }
 
-/* ───── PARSE LIVE API RESPONSE ───── */
-function parseLive(data) {
-    if (!Array.isArray(data) || data.length === 0) return null;
-    const entry = data[0];
-    const vals = {};
-    (entry.sensordatavalues || []).forEach(sv => {
-        vals[sv.value_type] = parseFloatOrNull(sv.value);
-    });
-    return {
-        timestamp:  entry.timestamp || new Date().toISOString(),
-        sensorType: entry.sensor?.sensor_type?.name || null,
-        pm25:  vals['P2']          ?? null,
-        pm10:  vals['P1']          ?? null,
-        temp:  vals['temperature'] ?? null,
-        hum:   vals['humidity']    ?? null,
-        pressure: vals['pressure'] ?? null,
-    };
+/* ───── ALL RECENT READINGS FROM LIVE API ───── */
+// The API returns the last ~3 readings per sensor; accumulate all unique ones into a list
+function extractAllReadings(pmRaw, envRaw) {
+    // Build env lookup by timestamp
+    const envMap = {};
+    if (envRaw && Array.isArray(envRaw)) {
+        envRaw.forEach(entry => {
+            const vals = {};
+            (entry.sensordatavalues || []).forEach(sv => { vals[sv.value_type] = parseFloatOrNull(sv.value); });
+            envMap[entry.timestamp] = { temp: vals['temperature'] ?? null, hum: vals['humidity'] ?? null, pressure: vals['pressure'] ?? null };
+        });
+    }
+    const result = [];
+    if (pmRaw && Array.isArray(pmRaw)) {
+        pmRaw.forEach(entry => {
+            const vals = {};
+            (entry.sensordatavalues || []).forEach(sv => { vals[sv.value_type] = parseFloatOrNull(sv.value); });
+            const env = envMap[entry.timestamp] || { temp: null, hum: null, pressure: null };
+            result.push({
+                timestamp: entry.timestamp,
+                pm25: vals['P2'] ?? null,
+                pm10: vals['P1'] ?? null,
+                ...env,
+            });
+        });
+    }
+    return result;
 }
 
 /* ───── CHART ───── */
@@ -716,54 +715,57 @@ async function refresh() {
     const overlayErr = document.getElementById('overlayErr');
     overlayErr.textContent = '';
 
+    // 1. Fetch live data from both sensors in parallel
     let liveEntry = null;
-    let sensorTypeName = null;
-
-    // 1. Fetch live data
+    let pmRaw = null, envRaw = null;
     try {
-        const raw = await fetchLive();
-        liveEntry = parseLive(raw);
-        sensorTypeName = liveEntry?.sensorType || null;
+        const [pmResult, envResult] = await Promise.allSettled([
+            fetchSensor(PM_SENSOR_ID),
+            fetchSensor(ENV_SENSOR_ID),
+        ]);
+        if (pmResult.status === 'fulfilled')  pmRaw  = pmResult.value;
+        if (envResult.status === 'fulfilled') envRaw = envResult.value;
+
+        liveEntry = await fetchLiveBoth();
     } catch (err) {
         console.warn('Live API error:', err);
-        overlayErr.textContent  = `Nie udało się pobrać danych: ${err.message}`;
+        overlayErr.textContent = `Błąd pobierania: ${err.message}`;
     }
 
     // 2. Load today's stored readings
     let stored = loadLocal();
 
-    // 3. Append live reading if new
-    if (liveEntry) {
-        const already = stored.some(r => r.timestamp === liveEntry.timestamp);
-        if (!already) stored = [...stored, liveEntry];
+    // 3. Add all new readings from the live API batch (the API returns last ~3 per sensor)
+    if (pmRaw) {
+        const newReadings = extractAllReadings(pmRaw, envRaw);
+        newReadings.forEach(r => {
+            if (!stored.some(s => s.timestamp === r.timestamp)) {
+                stored.push(r);
+            }
+        });
+        stored.sort((a, b) =>
+            new Date(a.timestamp.replace(' ', 'T')) - new Date(b.timestamp.replace(' ', 'T'))
+        );
         saveLocal(stored);
     }
 
-    // 4. Try Madavi intraday CSV (updates throughout the day)
-    let externalReadings = [];
-    let dataSourceLabel = 'Sensor.Community LiveAPI + pamięć lokalna';
+    // 4. Try sensor.community archive for today (available ~08:00 next day, usually 404 today)
+    //    Use it if it exists, otherwise fall back to localStorage accumulation
+    let archiveReadings = [];
+    try {
+        archiveReadings = await fetchArchiveCSV(todayStr());
+    } catch { /* expected – archive not yet available for current day */ }
 
-    if (sensorTypeName) {
-        try {
-            externalReadings = await fetchMadaviToday(sensorTypeName, todayStr());
-            dataSourceLabel = `Madavi.de CSV + LiveAPI (${externalReadings.length} pomiarów dnia)`;
-        } catch (e1) {
-            console.info('Madavi nie dostępne:', e1.message);
-            // fallback: try sensor.community archive (only has previous days)
-            // skip – archive.sensor.community only publishes ~08:00 for previous day
-        }
-    }
+    // 5. Build allReadings for today's chart
+    let allReadings = archiveReadings.length > 50
+        ? mergeReadings(archiveReadings, stored)   // archive has full day, merge in local for newest
+        : stored;                                  // no archive yet – use local accumulation
 
-    // 5. Merge: Madavi CSV + stored local readings
-    let allReadings = externalReadings.length > 0
-        ? mergeReadings(externalReadings, stored)
-        : stored;
-
-    // 6. Filter to current day only
+    // Filter strictly to today
     const today = todayStr();
     allReadings = allReadings.filter(r => r.timestamp.startsWith(today));
 
-    // 7. Update UI
+    // 6. Determine what to show in cards (prefer fresh liveEntry, fall back to latest stored)
     const latest = liveEntry ?? (allReadings.length > 0 ? allReadings[allReadings.length - 1] : null);
 
     if (latest) {
@@ -774,27 +776,30 @@ async function refresh() {
         updateHumCard(latest.hum);
         updateNormsTable(latest.pm25, latest.pm10);
         updateLastUpdate(latest.timestamp);
+    } else if (!liveEntry) {
+        overlayErr.textContent = 'Brak danych z czujników. Spróbuj odświeżyć stronę.';
     }
 
-    // 8. Chart
-    const dateLabel = document.getElementById('chartDateLabel');
-    dateLabel.textContent = formatDatePL(today);
-
+    // 7. Chart
+    document.getElementById('chartDateLabel').textContent = formatDatePL(today);
+    const srcLabel = archiveReadings.length > 50
+        ? `Archiwum + akumulacja lokalna (${allReadings.length} pomiarów)`
+        : `Akumulacja lokalna (${allReadings.length} pomiar${allReadings.length === 1 ? '' : 'ów'} dzisiaj)`;
+    document.getElementById('dataSourceInfo').textContent =
+        `Czujniki: SDS011 #${PM_SENSOR_ID} + BME280 #${ENV_SENSOR_ID} | ${srcLabel}`;
     document.getElementById('chartNote').textContent =
         allReadings.length === 0
-            ? 'Brak danych historycznych. Wykres będzie się uzupełniał przy kolejnych odświeżeniach.'
-            : allReadings.length === 1
-            ? 'Tylko jeden pomiar z dzisiejszego dnia. Wykres uzupełni się z czasem.'
+            ? 'Brak danych z dzisiejszego dnia. Wykres wypełni się przy kolejnych odświeżeniach (co 5 min).'
+            : allReadings.length < 3
+            ? `${allReadings.length} pomiar${allReadings.length === 1 ? '' : 'y'} z dzisiaj. Więcej danych pojawi się z każdym odświeżeniem.`
             : `${allReadings.length} pomiarów z dzisiejszego dnia.`;
-
-    document.getElementById('dataSourceInfo').textContent = `Źródło danych: ${dataSourceLabel}`;
 
     if (allReadings.length > 0) buildChart(allReadings);
 
-    // 9. Hide overlay
+    // 8. Hide overlay
     document.getElementById('overlay').style.display = 'none';
 
-    // 10. Schedule next refresh
+    // 9. Schedule next refresh
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(refresh, REFRESH_MS);
     startCountdown();
@@ -802,10 +807,9 @@ async function refresh() {
 
 /* ───── BOOT ───── */
 (async () => {
-    // Show today's date in chart header immediately
     document.getElementById('chartDateLabel').textContent = formatDatePL(todayStr());
 
-    // Load any locally stored data instantly so page isn't blank
+    // Instantly show any locally cached data from today so the page isn't blank
     const stored = loadLocal();
     if (stored.length > 0) {
         const latest = stored[stored.length - 1];
