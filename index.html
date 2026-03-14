@@ -188,7 +188,7 @@
     <div class="header-icon">🌬️</div>
     <h1>Monitoring Jakości Powietrza</h1>
     <p class="header-sub">📍 Rzochowska, Mielec, Polska</p>
-    <p class="header-meta">ID czujnika: 210868 &nbsp;|&nbsp; Źródło: Sensor.Community</p>
+    <p class="header-meta">ID czujnika: 210868 &nbsp;|&nbsp; Źródło: Sensor.Community / Madavi.de</p>
     <p id="lastUpdate">Pobieranie…</p>
 </header>
 
@@ -331,10 +331,14 @@
 
 /* ───── CONFIG ───── */
 const SENSOR_ID        = 210868;
-const API_URL          = `https://api.sensor.community/v1/sensor/${SENSOR_ID}/`;
+// NOTE: api.sensor.community is write-only; reads must use data.sensor.community
+const API_URL          = `https://data.sensor.community/airrohr/v1/sensor/${SENSOR_ID}/`;
 const ARCHIVE_BASE     = 'https://archive.sensor.community';
+const MADAVI_BASE      = 'https://api-rrd.madavi.de/data';
 const STORAGE_KEY      = `aq_${SENSOR_ID}`;
 const REFRESH_MS       = 5 * 60 * 1000;   // 5 minutes
+// User-Agent required by sensor.community API since 2022-11-04
+const UA_HEADER        = { 'User-Agent': 'AirQualityMonitor/1.0 (Mielec; educational)' };
 
 /* ───── POLISH AIR QUALITY LEVELS (GIOŚ) ───── */
 const PM25_LEVELS = [
@@ -403,20 +407,39 @@ function saveLocal(readings) {
 
 /* ───── API FETCH ───── */
 async function fetchLive() {
-    const r = await fetch(API_URL, { cache: 'no-store' });
+    // User-Agent is a forbidden header in browsers; the browser sends it automatically.
+    // We pass it as a hint but browsers will silently ignore the override (that's fine).
+    const r = await fetch(API_URL, {
+        cache: 'no-store',
+        headers: { 'Accept': 'application/json' },
+    });
     if (!r.ok) throw new Error(`API odpowiedział: ${r.status}`);
     return r.json();
 }
 
-/* ───── ARCHIVE CSV FETCH ───── */
+/* ───── MADAVI CSV FETCH (today's intraday data) ───── */
+// Madavi writes a CSV per sensor per day that grows throughout the day.
+// URL pattern: https://api-rrd.madavi.de/data/YYYY-MM-DD/YYYY-MM-DD_<type>_sensor_<id>.csv
+async function fetchMadaviToday(sensorTypeName, dateStr) {
+    const type = (sensorTypeName || 'sds011').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const url = `${MADAVI_BASE}/${dateStr}/${dateStr}_${type}_sensor_${SENSOR_ID}.csv`;
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`brak pliku Madavi (${r.status})`);
+    const text = await r.text();
+    return parseMadaviCSV(text);
+}
+
+/* ───── ARCHIVE CSV FETCH (previous days) ───── */
+// archive.sensor.community is generated once daily ~08:00 for the PREVIOUS day.
 async function fetchArchive(sensorTypeName, dateStr) {
-    const type = sensorTypeName.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const type = (sensorTypeName || 'sds011').toLowerCase().replace(/[^a-z0-9]/g, '');
     const url = `${ARCHIVE_BASE}/${dateStr}/${dateStr}_${type}_sensor_${SENSOR_ID}.csv`;
     const r = await fetch(url, { cache: 'no-store' });
     if (!r.ok) throw new Error('brak archiwum');
     return parseCSV(await r.text());
 }
 
+/* Parse sensor.community archive CSV (semicolon-separated) */
 function parseCSV(text) {
     const lines = text.trim().split('\n');
     if (lines.length < 2) return [];
@@ -434,6 +457,34 @@ function parseCSV(text) {
             pm10:  parseFloatOrNull(row['P1']),
             temp:  parseFloatOrNull(row['temperature'] || row['temp']),
             hum:   parseFloatOrNull(row['humidity']    || row['hum']),
+        });
+    }
+    return result.filter(r => r.pm25 !== null || r.pm10 !== null);
+}
+
+/* Parse Madavi CSV — uses comma separator and slightly different column names */
+function parseMadaviCSV(text) {
+    const lines = text.trim().split('\n');
+    if (lines.length < 2) return [];
+    // Detect separator (Madavi uses semicolons too in practice)
+    const sep = lines[0].includes(';') ? ';' : ',';
+    const headers = lines[0].split(sep).map(h => h.trim().replace(/^"|"$/g, ''));
+    const result = [];
+    for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(sep);
+        const row = {};
+        headers.forEach((h, idx) => { row[h] = (cols[idx] ?? '').trim().replace(/^"|"$/g, ''); });
+        // Madavi timestamp column names
+        const ts = row['Time'] || row['time'] || row['timestamp'] || row['Timestamp'] || '';
+        if (!ts) continue;
+        // Normalise timestamp to ISO-like format expected by rest of code
+        const normTs = ts.replace('T', ' ').replace(/Z$/, '');
+        result.push({
+            timestamp: normTs,
+            pm25:  parseFloatOrNull(row['SDS_P2'] || row['P2'] || row['pm2.5'] || row['pm25']),
+            pm10:  parseFloatOrNull(row['SDS_P1'] || row['P1'] || row['pm10']),
+            temp:  parseFloatOrNull(row['BME280_temperature'] || row['DHT22_temperature'] || row['temperature'] || row['temp']),
+            hum:   parseFloatOrNull(row['BME280_humidity']    || row['DHT22_humidity']    || row['humidity']    || row['hum']),
         });
     }
     return result.filter(r => r.pm25 !== null || r.pm10 !== null);
@@ -688,22 +739,24 @@ async function refresh() {
         saveLocal(stored);
     }
 
-    // 4. Try to enrich with archive CSV for today
-    let archiveReadings = [];
-    let dataSourceLabel = 'LiveAPI + pamięć lokalna';
+    // 4. Try Madavi intraday CSV (updates throughout the day)
+    let externalReadings = [];
+    let dataSourceLabel = 'Sensor.Community LiveAPI + pamięć lokalna';
 
     if (sensorTypeName) {
         try {
-            archiveReadings = await fetchArchive(sensorTypeName, todayStr());
-            dataSourceLabel = `Archiwum CSV + LiveAPI (${archiveReadings.length} pomiarów)`;
-        } catch {
-            // archive not available yet – normal for current day
+            externalReadings = await fetchMadaviToday(sensorTypeName, todayStr());
+            dataSourceLabel = `Madavi.de CSV + LiveAPI (${externalReadings.length} pomiarów dnia)`;
+        } catch (e1) {
+            console.info('Madavi nie dostępne:', e1.message);
+            // fallback: try sensor.community archive (only has previous days)
+            // skip – archive.sensor.community only publishes ~08:00 for previous day
         }
     }
 
-    // 5. Merge: archive + stored (archive takes priority for historical, stored adds very latest)
-    let allReadings = archiveReadings.length > 0
-        ? mergeReadings(archiveReadings, stored)
+    // 5. Merge: Madavi CSV + stored local readings
+    let allReadings = externalReadings.length > 0
+        ? mergeReadings(externalReadings, stored)
         : stored;
 
     // 6. Filter to current day only
