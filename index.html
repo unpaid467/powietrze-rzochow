@@ -106,6 +106,59 @@
         }
         .chart-wrap { position: relative; height: 280px; }
 
+        /* ───────── HISTORY NAVIGATION ───────── */
+        .history-nav {
+            display: flex; align-items: center; gap: .55rem;
+            margin-bottom: 1rem; flex-wrap: wrap;
+        }
+        .nav-btn {
+            background: var(--bg); border: 1px solid var(--border);
+            border-radius: 8px; padding: .32rem .75rem;
+            font-size: .84rem; font-family: inherit;
+            color: var(--text); cursor: pointer;
+            transition: background .15s, border-color .15s; white-space: nowrap;
+        }
+        .nav-btn:hover:not(:disabled) { background: var(--border); }
+        .nav-btn:disabled { opacity: .38; cursor: default; }
+        .nav-btn-today {
+            background: var(--blue2); border-color: var(--blue2);
+            color: #fff; font-weight: 600;
+        }
+        .nav-btn-today:hover:not(:disabled) { background: var(--blue1); border-color: var(--blue1); }
+        .nav-btn-today:disabled { background: var(--muted); border-color: var(--muted); }
+        #historyDatePicker {
+            border: 1px solid var(--border); border-radius: 8px;
+            padding: .32rem .6rem; font-size: .84rem;
+            font-family: inherit; color: var(--text);
+            background: var(--bg); cursor: pointer;
+        }
+        .history-loading {
+            display: flex; align-items: center; gap: .5rem;
+            font-size: .84rem; color: var(--muted); margin-bottom: .6rem;
+        }
+        .mini-spinner {
+            width: 15px; height: 15px; border: 2px solid var(--border);
+            border-top-color: var(--blue2); border-radius: 50%;
+            animation: spin .8s linear infinite; flex-shrink: 0;
+        }
+
+        /* ───────── HISTORY SUMMARY STATS ───────── */
+        .history-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+            gap: .5rem; margin-top: 1rem;
+        }
+        .summary-item {
+            background: var(--bg); border-radius: 10px;
+            padding: .55rem .75rem;
+            display: flex; flex-direction: column; gap: .12rem;
+        }
+        .summary-label {
+            font-size: .7rem; font-weight: 600;
+            text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+        }
+        .summary-val { font-size: 1.25rem; font-weight: 700; color: var(--text); }
+
         /* ───────── NORMS TABLE ───────── */
         .norms-card {
             background: var(--surface);
@@ -256,13 +309,53 @@
         </div>
     </section>
 
-    <!-- CHART -->
+    <!-- CHART / HISTORY -->
     <section>
-        <h2>📊 Przebieg Dnia <span id="chartDateLabel" class="tag-source"></span></h2>
+        <h2>📊 Historia Pomiarów</h2>
         <div class="chart-card">
+
+            <!-- Date navigation bar -->
+            <div class="history-nav">
+                <button id="btnPrevDay" class="nav-btn" title="Poprzedni dzień">&#8592; Wstecz</button>
+                <input type="date" id="historyDatePicker" />
+                <button id="btnNextDay" class="nav-btn" title="Następny dzień">Naprzód &#8594;</button>
+                <button id="btnToday" class="nav-btn nav-btn-today">Dzisiaj</button>
+                <span id="chartDateLabel" class="tag-source"></span>
+            </div>
+
+            <!-- Archive loading indicator -->
+            <div id="historyLoading" style="display:none" class="history-loading">
+                <span class="mini-spinner"></span> Ładowanie danych archiwalnych…
+            </div>
+
             <div class="chart-wrap">
                 <canvas id="mainChart"></canvas>
             </div>
+
+            <!-- Daily summary stats (visible when data is loaded) -->
+            <div id="historySummary" class="history-summary" style="display:none">
+                <div class="summary-item">
+                    <span class="summary-label">Śr. PM2.5</span>
+                    <span class="summary-val" id="sumAvgPM25">—</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-label">Maks. PM2.5</span>
+                    <span class="summary-val" id="sumMaxPM25">—</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-label">Śr. PM10</span>
+                    <span class="summary-val" id="sumAvgPM10">—</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-label">Maks. PM10</span>
+                    <span class="summary-val" id="sumMaxPM10">—</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-label">Pomiarów</span>
+                    <span class="summary-val" id="sumCount">—</span>
+                </div>
+            </div>
+
             <p class="chart-note" id="chartNote"></p>
         </div>
     </section>
@@ -693,6 +786,123 @@ function mergeReadings(a, b) {
     );
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ *  DATA SOURCE LAYER
+ *
+ *  ► OPTION B MIGRATION POINT ◄
+ *  When you add a backend server, replace the body of fetchDayFromSource()
+ *  with a call to your own API, for example:
+ *
+ *      return fetch(`/api/history?date=${dateStr}`).then(r => r.json());
+ *
+ *  The returned array must contain objects with the shape:
+ *      { timestamp: string, pm25: number|null, pm10: number|null,
+ *        temp: number|null, hum: number|null }
+ *
+ *  Everything else (cache, navigation, chart rendering) stays the same.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+async function fetchDayFromSource(dateStr) {
+    // OPTION A — fetch from sensor.community public archive CSV
+    return fetchArchiveCSV(dateStr);
+}
+
+/* In-memory cache so revisiting an already-loaded day is instant */
+const historyCache = new Map();
+let currentViewDate = '';   // initialised by initHistoryControls()
+
+async function loadDayData(dateStr) {
+    if (dateStr === todayStr()) {
+        return loadLocal();   // today: use localStorage accumulation
+    }
+    if (historyCache.has(dateStr)) {
+        return historyCache.get(dateStr);
+    }
+    const data = await fetchDayFromSource(dateStr);
+    historyCache.set(dateStr, data);
+    return data;
+}
+
+/* ───── HISTORY UI HELPERS ───── */
+
+function updateNavUI(dateStr) {
+    const today = todayStr();
+    document.getElementById('historyDatePicker').value = dateStr;
+    document.getElementById('chartDateLabel').textContent = formatDatePL(dateStr);
+    document.getElementById('btnNextDay').disabled = dateStr >= today;
+    document.getElementById('btnToday').disabled   = dateStr === today;
+}
+
+function updateChartSummary(data) {
+    const pm25Vals = data.map(r => r.pm25).filter(v => v !== null);
+    const pm10Vals = data.map(r => r.pm10).filter(v => v !== null);
+    const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+    const max = arr => arr.length ? Math.max(...arr) : null;
+    const fmt = v => v !== null ? v.toFixed(1) + ' µg/m³' : '—';
+    document.getElementById('sumAvgPM25').textContent = fmt(avg(pm25Vals));
+    document.getElementById('sumMaxPM25').textContent = fmt(max(pm25Vals));
+    document.getElementById('sumAvgPM10').textContent = fmt(avg(pm10Vals));
+    document.getElementById('sumMaxPM10').textContent = fmt(max(pm10Vals));
+    document.getElementById('sumCount').textContent   = data.length;
+}
+
+async function showHistoryDay(dateStr) {
+    if (currentViewDate === dateStr) return;   // already showing this day
+    currentViewDate = dateStr;
+    updateNavUI(dateStr);
+
+    const isToday   = dateStr === todayStr();
+    const loading   = document.getElementById('historyLoading');
+    const summary   = document.getElementById('historySummary');
+    const chartNote = document.getElementById('chartNote');
+
+    if (!isToday) loading.style.display = 'flex';
+    summary.style.display = 'none';
+
+    try {
+        const data = await loadDayData(dateStr);
+        if (data.length > 0) {
+            buildChart(data);
+            updateChartSummary(data);
+            summary.style.display = 'grid';
+            chartNote.textContent =
+                `${data.length} pomiarów • ${formatDatePL(dateStr)}` +
+                (isToday ? ' (dzisiejsze dane, odświeżane co 5 min)' : ' (dane archiwalne)');
+        } else {
+            if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+            chartNote.textContent = isToday
+                ? 'Brak danych z dzisiejszego dnia. Wykres wypełni się przy kolejnych odświeżeniach (co 5 min).'
+                : 'Brak danych archiwalnych dla wybranego dnia. Dane publikowane są następnego dnia po ~08:00.';
+        }
+    } catch (err) {
+        chartNote.textContent = `Błąd ładowania danych: ${err.message}`;
+        summary.style.display = 'none';
+    } finally {
+        loading.style.display = 'none';
+    }
+}
+
+function initHistoryControls() {
+    currentViewDate = todayStr();
+    const picker = document.getElementById('historyDatePicker');
+    picker.max = todayStr();
+    picker.min = '2020-01-01';
+    picker.value = todayStr();
+    updateNavUI(todayStr());
+
+    function offsetDay(delta) {
+        const d = new Date(currentViewDate + 'T00:00:00');
+        d.setDate(d.getDate() + delta);
+        const next = d.toISOString().slice(0, 10);
+        if (next <= todayStr() && next >= picker.min) showHistoryDay(next);
+    }
+
+    document.getElementById('btnPrevDay').addEventListener('click', () => offsetDay(-1));
+    document.getElementById('btnNextDay').addEventListener('click', () => offsetDay(+1));
+    document.getElementById('btnToday').addEventListener('click',   () => showHistoryDay(todayStr()));
+    picker.addEventListener('change', () => { if (picker.value) showHistoryDay(picker.value); });
+}
+
 /* ───── COUNTDOWN TIMER ───── */
 let countdownSec = REFRESH_MS / 1000;
 let countdownInterval = null;
@@ -780,21 +990,29 @@ async function refresh() {
         overlayErr.textContent = 'Brak danych z czujników. Spróbuj odświeżyć stronę.';
     }
 
-    // 7. Chart
-    document.getElementById('chartDateLabel').textContent = formatDatePL(today);
+    // 7. Chart — only redraw/update if the user is currently viewing today
+    //    (if they navigated to a historical day, leave the chart as-is)
     const srcLabel = archiveReadings.length > 50
         ? `Archiwum + akumulacja lokalna (${allReadings.length} pomiarów)`
         : `Akumulacja lokalna (${allReadings.length} pomiar${allReadings.length === 1 ? '' : 'ów'} dzisiaj)`;
     document.getElementById('dataSourceInfo').textContent =
         `Czujniki: SDS011 #${PM_SENSOR_ID} + BME280 #${ENV_SENSOR_ID} | ${srcLabel}`;
-    document.getElementById('chartNote').textContent =
-        allReadings.length === 0
-            ? 'Brak danych z dzisiejszego dnia. Wykres wypełni się przy kolejnych odświeżeniach (co 5 min).'
-            : allReadings.length < 3
-            ? `${allReadings.length} pomiar${allReadings.length === 1 ? '' : 'y'} z dzisiaj. Więcej danych pojawi się z każdym odświeżeniem.`
-            : `${allReadings.length} pomiarów z dzisiejszego dnia.`;
 
-    if (allReadings.length > 0) buildChart(allReadings);
+    if (currentViewDate === todayStr()) {
+        updateNavUI(todayStr());
+        if (allReadings.length > 0) {
+            buildChart(allReadings);
+            updateChartSummary(allReadings);
+            document.getElementById('historySummary').style.display = 'grid';
+            document.getElementById('chartNote').textContent =
+                allReadings.length < 3
+                    ? `${allReadings.length} pomiar${allReadings.length === 1 ? '' : 'y'} z dzisiaj. Więcej danych pojawi się z każdym odświeżeniem.`
+                    : `${allReadings.length} pomiarów • ${formatDatePL(todayStr())} (odświeżane co 5 min)`;
+        } else {
+            document.getElementById('chartNote').textContent =
+                'Brak danych z dzisiejszego dnia. Wykres wypełni się przy kolejnych odświeżeniach (co 5 min).';
+        }
+    }
 
     // 8. Hide overlay
     document.getElementById('overlay').style.display = 'none';
@@ -807,7 +1025,7 @@ async function refresh() {
 
 /* ───── BOOT ───── */
 (async () => {
-    document.getElementById('chartDateLabel').textContent = formatDatePL(todayStr());
+    initHistoryControls();   // sets up date picker + nav buttons
 
     // Instantly show any locally cached data from today so the page isn't blank
     const stored = loadLocal();
@@ -820,6 +1038,8 @@ async function refresh() {
         updateHumCard(latest.hum);
         updateNormsTable(latest.pm25, latest.pm10);
         buildChart(stored);
+        updateChartSummary(stored);
+        document.getElementById('historySummary').style.display = 'grid';
         document.getElementById('overlay').style.display = 'none';
     }
 
